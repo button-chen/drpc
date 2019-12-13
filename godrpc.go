@@ -1,4 +1,4 @@
-package main
+package drpc
 
 import (
 	"encoding/json"

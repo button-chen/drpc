@@ -1,4 +1,4 @@
-package main
+package drpc
 
 const (
 	// ErrCodeOK 成功
