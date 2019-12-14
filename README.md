@@ -1,4 +1,4 @@
-# drpc特点
+## drpc特点
 - drpc实现为可以单机或者多机分布式部署
 - 单机部署例子：  
 drpcd.exe -addr=:8080  
@@ -10,13 +10,17 @@ drpcd.exe -addr=192.168.1.12:8080 -peer=192.168.1.11:8080    // 加入到IP 11�
 drpcd.exe -addr=192.168.1.13:8080 -peer=192.168.1.12:8080    // 加入到IP 12机器的drpcd服务群  
 ...   
 此时这些drpcd服务会相互连接为一个连通无环图， 比如有程序在IP 11机器上注册了函数 foo ，此时另外的程序可以连接IP 13机器调用foo函数(即使foo函数没有被直接注册到IP 13的机器上) 所有被注册的功能函数在drpcd服务群中是共享的。  
-  
+
+- 浏览器访问： ip:port/functions 可以看到当前drpcd群中所有注册的函数与所有的drpcd主机IP
+ 
 注意：  
 1：单台电脑上测试多机部署，可以用相同的ip 不同的绑定端口测试  
 2：单机部署的addr命令行参数可以只写端口不写IP， 多机部署必须写完整的IP与端口  
 
+## 部署
+<div align=center><img width="700" height="360" src="https://github.com/button-chen/drpc/blob/master/image/9527.png"/></div>
 
-# 使用
+## 开发
 
 - go get github.com/button-chen/drpc/...
 - golang版本大于等于 1.13.5
