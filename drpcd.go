@@ -143,7 +143,7 @@ func (d *DRPC) registerNotify(que chan DRpcMsg) {
 	d.updateClusterNetAddrs(string(netAddrInfo))
 }
 
-func (d *DRPC) updateClusterNetAddrs (netAddrInfo string) {
+func (d *DRPC) updateClusterNetAddrs(netAddrInfo string) {
 	for _, que := range d.NotifyMember {
 		msg := DRpcMsg{
 			Type: TypeUpdateNetAddr,
@@ -181,7 +181,7 @@ func (d *DRPC) debugView(w http.ResponseWriter, r *http.Request) {
 	}
 	dbgInfo := struct {
 		Methods []string
-		Addrs []string
+		Addrs   []string
 	}{
 		nameList,
 		netAddrs,
@@ -219,7 +219,7 @@ func (d *DRPC) timeoutDelete() {
 func (d *DRPC) writeMessage(c *websocket.Conn, que chan DRpcMsg, done chan struct{}) {
 	for {
 		select {
-		case msg := <- que:
+		case msg := <-que:
 			c.WriteJSON(msg)
 
 		case <-done:
@@ -242,7 +242,7 @@ func (d *DRPC) readMessage(c *websocket.Conn, que chan DRpcMsg, done chan struct
 			d.registerNotify(que)
 		}
 		select {
-		case <- done:
+		case <-done:
 			return
 		case <-d.stop:
 			return
@@ -353,7 +353,6 @@ func (d *DRPC) reg(msg DRpcMsg, que chan DRpcMsg) {
 		d.notify(msg, que)
 		return
 	}
-	msg.Type = TypeResp
 	msg.ErrCode = ErrCodeFunctionBeRegistered
 	d.writeError(msg, que)
 }
@@ -424,5 +423,6 @@ func (d *DRPC) resp(msg DRpcMsg) {
 }
 
 func (d *DRPC) writeError(msg DRpcMsg, que chan DRpcMsg) {
+	msg.Type = TypeResp
 	que <- msg
 }

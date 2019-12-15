@@ -41,15 +41,16 @@ func NewDRPCClient() *DRpcClient {
 }
 
 // ConnectToDRPC 连接到服务器
-func (d *DRpcClient) ConnectToDRPC(addr string) {
+func (d *DRpcClient) ConnectToDRPC(addr string) error {
 	u := url.URL{Scheme: "ws", Host: addr, Path: "/"}
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
-		log.Fatal("dial:", err)
+		return err
 	}
 	d.conn = c
 	go d.read()
 	go d.execCallback()
+	return nil
 }
 
 // Call 同步调用
@@ -73,7 +74,8 @@ func (d *DRpcClient) Call(fnName string, param []byte, timeout int64) ([]byte, e
 	var err error
 	select {
 	case ret = <-retChan:
-	case <-time.After(time.Millisecond * time.Duration(timeout)):
+	case <-time.After(time.Millisecond * time.Duration(timeout*2)):
+		ret.ErrCode = ErrCodeRepTimeout
 		log.Println("timeout ms: ", timeout)
 	case <-d.stop:
 		return []byte(ret.Body), nil
@@ -164,7 +166,7 @@ func (d *DRpcClient) recvResp(msg DRpcMsg) {
 			var err error
 			m := msg
 			if m.ErrCode != ErrCodeOK {
-				err = fmt.Errorf("errCode: %d", m.ErrCode)
+				err = fmt.Errorf("errCode async: %d", m.ErrCode)
 			}
 			fn(m.UniqueID, []byte(m.Body), err)
 		}
@@ -183,7 +185,10 @@ func (d *DRpcClient) read() {
 			return
 		}
 		var msg DRpcMsg
-		json.Unmarshal(message, &msg)
+		err = json.Unmarshal(message, &msg)
+		if err != nil {
+			continue
+		}
 		switch msg.Type {
 		case TypeCall:
 			d.recvCall(msg)
