@@ -2,6 +2,7 @@ package drpc
 
 import (
 	"encoding/json"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -53,7 +54,8 @@ func NewDRPC() *DRPC {
 func (d *DRPC) Run(addr string) {
 	d.init()
 	http.HandleFunc("/", d.acceptConn)
-	http.HandleFunc("/functions", d.debugView)
+	http.HandleFunc("/drpcd/info", d.debugView)
+	http.HandleFunc("/drpcd/call", d.httpCall)
 	go func() {
 		log.Fatal(http.ListenAndServe(addr, nil))
 	}()
@@ -188,6 +190,37 @@ func (d *DRPC) debugView(w http.ResponseWriter, r *http.Request) {
 	}
 	info, _ := json.Marshal(dbgInfo)
 	w.Write(info)
+}
+
+func (d *DRPC) httpCall(w http.ResponseWriter, r *http.Request) {
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return
+	}
+	defer r.Body.Close()
+
+	var httpResp DRpcMsgHTTP
+
+	var msg DRpcMsg
+	err = json.Unmarshal(body, &msg)
+	if err != nil {
+		httpResp.ErrCode = ErrCodeParamFormatError
+		resp, _ := json.Marshal(httpResp)
+		w.Write(resp)
+		return
+	}
+	msg.Type = TypeCall
+	msg.UniqueID = time.Now().UnixNano()
+
+	que := make(chan DRpcMsg, 1)
+	d.call(msg, que)
+
+	msg = <-que
+
+	httpResp.Body = msg.Body
+	httpResp.ErrCode = msg.ErrCode
+	resp, _ := json.Marshal(httpResp)
+	w.Write(resp)
 }
 
 func (d *DRPC) timeoutDelete() {

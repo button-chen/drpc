@@ -68,3 +68,13 @@ type DRpcMsg struct {
 	// 请求调用时是参数，应答时是返回值，一般是json格式
 	Body string
 }
+
+// DRpcMsgHTTP 客户端是http
+type DRpcMsgHTTP struct {
+
+	// ErrCode 错误代码，一般是应答方赋值
+	ErrCode int
+
+	// 请求调用时是参数，应答时是返回值，一般是json格式
+	Body string
+}
