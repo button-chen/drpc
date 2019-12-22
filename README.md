@@ -11,7 +11,8 @@ drpcd.exe -addr=192.168.1.13:8080 -peer=192.168.1.12:8080    // 加入到IP 12�
 ...   
 此时这些drpcd服务会相互连接为一个连通无环图， 比如有程序在IP 11机器上注册了函数 foo ，此时另外的程序可以连接IP 13机器调用foo函数(即使foo函数没有被直接注册到IP 13的机器上) 所有被注册的功能函数在drpcd服务群中是共享的。  
 
-- 浏览器访问： ip:port/drpcd/info 可以看到当前drpcd群中所有注册的函数与所有的drpcd主机IP
+- 浏览器访问： ip:port/drpcd/methodsdoc 可以看到当前drpcd群中所有注册的函数与使用说明(由于对html不熟，目前直接返回json给浏览器，格式很丑陋，之后会使用html展示)  
+- 浏览器访问： ip:port/drpcd/clusteraddrs 可以看到当前drpcd群中所有drpcd的网络地址
  
 注意：  
 1：单台电脑上测试多机部署，可以用相同的ip 不同的绑定端口测试  
@@ -32,28 +33,71 @@ https://blog.csdn.net/chen802311/article/details/103534785
 package main
 
 import (
-	"github.com/button-chen/drpc"
+	"crypto/hmac"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
 	"os"
 	"os/signal"
+
+	"github.com/button-chen/drpc"
 )
 
 // 被注册的函数参数与返回值都必须为[]byte，实际上就是json格式
-// 思想： 把任何需要注册的函数的参数和返回值都json化进行调用，虽
-// 然看上去有点别扭，但是这种实现确实是最简单的
-func foo(param []byte) []byte {
-	return []byte("call foo")
+// 思想： 把任何需要注册的函数的参数和返回值都json化进行调用
+func myHMACMD5(param []byte) []byte {
+	pts := struct {
+		Key  string `json:"key"`
+		Data string `json:"data"`
+	}{}
+	err := json.Unmarshal(param, &pts)
+	if err != nil {
+		return []byte("")
+	}
+	hmac := hmac.New(md5.New, []byte(pts.Key))
+	hmac.Write([]byte(pts.Data))
+
+	ret := struct {
+		Result string `json:"result"`
+	}{
+		hex.EncodeToString(hmac.Sum(nil)),
+	}
+	t, _ := json.Marshal(ret)
+	return t
 }
 
+var myHMACMD5Doc = `
+函数名：myHMACMD5 
+功能: 计算hmac-md5
+参数(json)：
+{
+	"key":"",    // hmac-md5需要的key
+	"data":""    // hmac-md5需要加密的字符串
+}
+返回值(json)：
+{
+	"result":""
+}
+`
+
+var (
+	addr = flag.String("addr", "127.0.0.1:8080", "address")
+	name = flag.String("reg", "myHMACMD5", "address")
+)
+
 func main() {
+	flag.Parse()
+
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 
 	// 创建一个rpc客户端实例
 	rpcclient := drpc.NewDRPCClient()
 	// 连接到服务器
-	rpcclient.ConnectToDRPC("127.0.0.1:8080")
+	rpcclient.ConnectToDRPC(*addr)
 	// 注册功能函数
-	rpcclient.Register("foo", foo)
+	rpcclient.Register(*name, myHMACMD5Doc, myHMACMD5)
 
 	<-interrupt
 }
@@ -85,23 +129,51 @@ post 方式访问：http://ip:port/drpcd/call
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"log"
+	"os"
+	"os/signal"
 	"time"
 
 	"github.com/button-chen/drpc"
 )
 
+var (
+	addr = flag.String("addr", "127.0.0.1:8080", "address")
+	name = flag.String("call", "myHMACMD5", "function name")
+)
+
 func main() {
+	flag.Parse()
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
 
 	rpcclient := drpc.NewDRPCClient()
-	rpcclient.ConnectToDRPC("127.0.0.1:8080")
-
+	err := rpcclient.ConnectToDRPC(*addr)
+	if err != nil {
+		log.Println(err.Error())
+		return
+	}
 	// 同步调用(不适合高频率的调用方式)
-	ret, err := rpcclient.Call("test", []byte("myparam"), 2000)
+	param := struct {
+		Key  string `json:"key"`
+		Data string `json:"data"`
+	}{
+		"123",
+		"mydata",
+	}
+	t, _ := json.Marshal(param)
+	ret, err := rpcclient.Call(*name, t, 2000)
+
+	tmp := struct {
+		Result string `json:"result"`
+	}{}
 	if err != nil {
 		log.Println("err:", err.Error())
 	} else {
-		log.Println("result:", string(ret))
+		json.Unmarshal(ret, &tmp)
+		log.Println("result:", tmp.Result)
 	}
 
 	// 异步调用的回调函数，效率较高可以适用高频率调用
@@ -109,15 +181,18 @@ func main() {
 		if err != nil {
 			log.Println("err: ", err.Error())
 		} else {
-			log.Println("return: ", id, string(msg))
+			json.Unmarshal(ret, &tmp)
+			log.Println("return async: ", tmp.Result)
 		}
 	}
 	for {
-		id := rpcclient.AsyncCall("foo", []byte("myparam"), 2000, fn)
+		id := rpcclient.AsyncCall(*name, t, 2000, fn)
 		// 返回的id与回调结果的第一个参数一致
 		_ = id
 		time.Sleep(time.Millisecond * 10)
 	}
+
+	<-interrupt
 }
 ```
 注： 使用专用客户端库，即可以调用共享功能也可以注册共享功能，而且支持同步与异步调用。
