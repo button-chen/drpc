@@ -105,11 +105,12 @@ func (d *DRpcClient) AsyncCall(fnName string, param []byte, timeout int64, fn fu
 }
 
 // Register 注册功能函数
-func (d *DRpcClient) Register(fnName string, fn func(param []byte) []byte) {
+func (d *DRpcClient) Register(fnName, callDoc string, fn func(param []byte) []byte) {
 	d.regFunc[fnName] = fn
 	retMsg := DRpcMsg{
 		Type:     TypeReg,
 		FuncName: fnName,
+		Doc:      callDoc,
 	}
 	err := d.conn.WriteJSON(retMsg)
 	if err != nil {

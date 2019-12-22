@@ -16,6 +16,7 @@ import (
 type DRPC struct {
 	// 所有已经注册的方法名
 	MethodOwner map[string]chan DRpcMsg
+	MethodDoc   map[string]string
 	mtxm        sync.Mutex
 
 	// WaitResp(mark--timestamp and connnect) 等待应答
@@ -54,7 +55,8 @@ func NewDRPC() *DRPC {
 func (d *DRPC) Run(addr string) {
 	d.init()
 	http.HandleFunc("/", d.acceptConn)
-	http.HandleFunc("/drpcd/info", d.debugView)
+	http.HandleFunc("/drpcd/methodsdoc", d.drpcdMethodsDoc)
+	http.HandleFunc("/drpcd/clusteraddrs", d.drpcdClusterAddrs)
 	http.HandleFunc("/drpcd/call", d.httpCall)
 	go func() {
 		log.Fatal(http.ListenAndServe(addr, nil))
@@ -76,6 +78,7 @@ func (d *DRPC) Stop() {
 
 func (d *DRPC) init() {
 	d.MethodOwner = make(map[string]chan DRpcMsg)
+	d.MethodDoc = make(map[string]string)
 	d.WaitResp = make(map[int64]connWait)
 	d.NotifyMember = make([]chan DRpcMsg, 0)
 	d.ClusterAddr = make(map[string]struct{})
@@ -179,20 +182,20 @@ func (d *DRPC) acceptConn(w http.ResponseWriter, r *http.Request) {
 	go d.timeoutDelete()
 }
 
-func (d *DRPC) debugView(w http.ResponseWriter, r *http.Request) {
-	nameList := d.getAllRegFnName()
+func (d *DRPC) drpcdClusterAddrs(w http.ResponseWriter, r *http.Request) {
 	var netAddrs []string
 	for addr := range d.ClusterAddr {
 		netAddrs = append(netAddrs, addr)
 	}
-	dbgInfo := struct {
-		Methods []string
-		Addrs   []string
-	}{
-		nameList,
-		netAddrs,
+	if len(netAddrs) == 0 {
+		netAddrs = append(netAddrs, d.addr)
 	}
-	info, _ := json.Marshal(dbgInfo)
+	info, _ := json.Marshal(netAddrs)
+	w.Write(info)
+}
+
+func (d *DRPC) drpcdMethodsDoc(w http.ResponseWriter, r *http.Request) {
+	info, _ := json.MarshalIndent(d.MethodDoc, " ", "	")
 	w.Write(info)
 }
 
@@ -362,7 +365,7 @@ func (d *DRPC) getAllRegFnName() []string {
 	d.mtxm.Lock()
 	defer d.mtxm.Unlock()
 	var nameList []string
-	for fnName := range d.MethodOwner {
+	for fnName := range d.MethodDoc {
 		nameList = append(nameList, fnName)
 	}
 	return nameList
@@ -386,6 +389,7 @@ func (d *DRPC) reg(msg DRpcMsg, que chan DRpcMsg) {
 	defer d.mtxm.Unlock()
 	if _, ok := d.MethodOwner[msg.FuncName]; !ok {
 		d.MethodOwner[msg.FuncName] = que
+		d.MethodDoc[msg.FuncName] = msg.Doc
 
 		d.notify(msg, que)
 		return
@@ -397,6 +401,7 @@ func (d *DRPC) reg(msg DRpcMsg, que chan DRpcMsg) {
 func (d *DRPC) unReg(msg DRpcMsg) {
 	d.mtxm.Lock()
 	delete(d.MethodOwner, msg.FuncName)
+	delete(d.MethodDoc, msg.FuncName)
 	d.mtxm.Unlock()
 }
 
@@ -431,6 +436,7 @@ func (d *DRPC) del(que chan DRpcMsg) []string {
 	for fnName, conn := range d.MethodOwner {
 		if que == conn {
 			delete(d.MethodOwner, fnName)
+			delete(d.MethodDoc, fnName)
 			fnNames = append(fnNames, fnName)
 		}
 	}
