@@ -160,7 +160,11 @@ func (d *DRPC) updateClusterNetAddrs(netAddrInfo string) {
 	}
 }
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
 
 func (d *DRPC) acceptConn(w http.ResponseWriter, r *http.Request) {
 	c, err := upgrader.Upgrade(w, r, nil)
