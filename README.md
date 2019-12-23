@@ -1,3 +1,6 @@
+## drpc功能设计图
+https://blog.csdn.net/chen802311/article/details/103534785
+
 ## drpc部署
 - drpc实现为可以单机或者多机分布式部署
 - 单机部署例子：  
@@ -17,9 +20,6 @@ drpcd.exe -addr=192.168.1.13:8080 -peer=192.168.1.12:8080    // 加入到IP 12�
 注意：  
 1：单台电脑上测试多机部署，可以用相同的ip 不同的绑定端口测试  
 2：单机部署的addr命令行参数可以只写端口不写IP， 多机部署必须写完整的IP与端口  
-
-## drpc设计图
-https://blog.csdn.net/chen802311/article/details/103534785
 
 ## 开发
 
