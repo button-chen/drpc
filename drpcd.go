@@ -286,6 +286,19 @@ func (d *DRPC) readMessage(c *websocket.Conn, que chan DRpcMsg, done chan struct
 			// 收到注册的同时也需要注册到对方
 			d.registerNotify(que)
 		}
+		if ty == TypeSub {
+			defer func() {
+				log.Println("regist sub clear func")
+				d.mtxt.Lock()
+				for k, subs := range d.TopicSub {
+					if _, ok := subs[que]; ok {
+						delete(d.TopicSub[k], que)
+						log.Println("delete topic a sub: ", k)
+					}
+				}
+				d.mtxt.Unlock()
+			}()
+		}
 		select {
 		case <-done:
 			return
@@ -337,7 +350,7 @@ func (d *DRPC) _readMessage(c *websocket.Conn, que chan DRpcMsg) (int, error) {
 		log.Println("recv TypeSub")
 		d.sub(msg, que)
 	case TypePub:
-		d.pub(msg)
+		d.pub(msg, que)
 	}
 	return msg.Type, nil
 }
@@ -463,6 +476,10 @@ func (d *DRPC) del(que chan DRpcMsg) []string {
 	}
 	d.mtxw.Unlock()
 
+	d.mtxt.Lock()
+
+	d.mtxt.Unlock()
+
 	return fnNames
 }
 
@@ -485,10 +502,11 @@ func (d *DRPC) sub(msg DRpcMsg, que chan DRpcMsg) {
 	if _, ok := d.TopicSub[msg.FuncName]; !ok {
 		d.TopicSub[msg.FuncName] = make(map[chan DRpcMsg]struct{})
 	}
+	d.notify(msg, que)
 	d.TopicSub[msg.FuncName][que] = struct{}{}
 }
 
-func (d *DRPC) pub(msg DRpcMsg) {
+func (d *DRPC) pub(msg DRpcMsg, que chan DRpcMsg) {
 	d.mtxt.Lock()
 	defer d.mtxt.Unlock()
 
@@ -496,11 +514,14 @@ func (d *DRPC) pub(msg DRpcMsg) {
 	if !ok {
 		return
 	}
-	msg.Type = TypeSub
 	for sub := range subs {
+		if que == sub {
+			continue
+		}
 		select {
 		case sub <- msg:
 		case <-time.After(time.Millisecond * time.Duration(msg.Timeout)):
+			log.Println("publish timeout: ", msg.Timeout)
 		}
 	}
 }

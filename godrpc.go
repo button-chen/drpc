@@ -245,7 +245,7 @@ func (d *DRpcClient) read() {
 			d.recvCall(msg)
 		case TypeResp:
 			d.recvResp(msg)
-		case TypeSub:
+		case TypePub:
 			d.recvSub(msg)
 		default:
 			log.Println("unknow type: ", msg)
