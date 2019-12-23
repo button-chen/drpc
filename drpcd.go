@@ -19,6 +19,10 @@ type DRPC struct {
 	MethodDoc   map[string]string
 	mtxm        sync.Mutex
 
+	// 发布订阅
+	TopicSub map[string]map[chan DRpcMsg]struct{}
+	mtxt     sync.Mutex
+
 	// WaitResp(mark--timestamp and connnect) 等待应答
 	WaitResp map[int64]connWait
 	mtxw     sync.Mutex
@@ -82,6 +86,7 @@ func (d *DRPC) init() {
 	d.WaitResp = make(map[int64]connWait)
 	d.NotifyMember = make([]chan DRpcMsg, 0)
 	d.ClusterAddr = make(map[string]struct{})
+	d.TopicSub = make(map[string]map[chan DRpcMsg]struct{})
 	d.stop = make(chan struct{})
 }
 
@@ -328,6 +333,11 @@ func (d *DRPC) _readMessage(c *websocket.Conn, que chan DRpcMsg) (int, error) {
 	case TypeUpdateNetAddr:
 		log.Println("recv TypeUpdateNetAddr")
 		d.update(msg)
+	case TypeSub:
+		log.Println("recv TypeSub")
+		d.sub(msg, que)
+	case TypePub:
+		d.pub(msg)
 	}
 	return msg.Type, nil
 }
@@ -392,6 +402,9 @@ func (d *DRPC) reg(msg DRpcMsg, que chan DRpcMsg) {
 		d.MethodDoc[msg.FuncName] = msg.Doc
 
 		d.notify(msg, que)
+
+		msg.ErrCode = ErrCodeOK
+		d.writeError(msg, que)
 		return
 	}
 	msg.ErrCode = ErrCodeFunctionBeRegistered
@@ -463,6 +476,33 @@ func (d *DRPC) resp(msg DRpcMsg) {
 	delete(d.WaitResp, msg.UniqueID)
 
 	ct.conn <- msg
+}
+
+func (d *DRPC) sub(msg DRpcMsg, que chan DRpcMsg) {
+	d.mtxt.Lock()
+	defer d.mtxt.Unlock()
+
+	if _, ok := d.TopicSub[msg.FuncName]; !ok {
+		d.TopicSub[msg.FuncName] = make(map[chan DRpcMsg]struct{})
+	}
+	d.TopicSub[msg.FuncName][que] = struct{}{}
+}
+
+func (d *DRPC) pub(msg DRpcMsg) {
+	d.mtxt.Lock()
+	defer d.mtxt.Unlock()
+
+	subs, ok := d.TopicSub[msg.FuncName]
+	if !ok {
+		return
+	}
+	msg.Type = TypeSub
+	for sub := range subs {
+		select {
+		case sub <- msg:
+		case <-time.After(time.Millisecond * time.Duration(msg.Timeout)):
+		}
+	}
 }
 
 func (d *DRPC) writeError(msg DRpcMsg, que chan DRpcMsg) {

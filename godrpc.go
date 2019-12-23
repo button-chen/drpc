@@ -26,17 +26,21 @@ type DRpcClient struct {
 	aresult    map[int64]func(int64, []byte, error)
 	amu        sync.Mutex
 
+	// 发布订阅
+	topicCallback map[string]func(string, error)
+
 	stop chan struct{}
 }
 
 // NewDRPCClient 新建
 func NewDRPCClient() *DRpcClient {
 	return &DRpcClient{
-		regFunc:    make(map[string]func(param []byte) []byte),
-		result:     make(map[int64]chan DRpcMsg),
-		asyncCache: make(chan func(), 1024),
-		aresult:    make(map[int64]func(int64, []byte, error)),
-		stop:       make(chan struct{}),
+		regFunc:       make(map[string]func(param []byte) []byte),
+		result:        make(map[int64]chan DRpcMsg),
+		asyncCache:    make(chan func(), 1024),
+		aresult:       make(map[int64]func(int64, []byte, error)),
+		topicCallback: make(map[string]func(string, error)),
+		stop:          make(chan struct{}),
 	}
 }
 
@@ -63,27 +67,7 @@ func (d *DRpcClient) Call(fnName string, param []byte, timeout int64) ([]byte, e
 		Timeout:  timeout,
 		Body:     string(param),
 	}
-	retChan := make(chan DRpcMsg, 1)
-	d.mu.Lock()
-	d.result[uid] = retChan
-	d.mu.Unlock()
-
-	d.conn.WriteJSON(req)
-
-	var ret DRpcMsg
-	var err error
-	select {
-	case ret = <-retChan:
-	case <-time.After(time.Millisecond * time.Duration(timeout*2)):
-		ret.ErrCode = ErrCodeRepTimeout
-		log.Println("timeout ms: ", timeout)
-	case <-d.stop:
-		return []byte(ret.Body), nil
-	}
-	if ret.ErrCode != ErrCodeOK {
-		err = fmt.Errorf("errCode: %d", ret.ErrCode)
-	}
-	return []byte(ret.Body), err
+	return d.call(req)
 }
 
 // AsyncCall 异步调用
@@ -105,18 +89,75 @@ func (d *DRpcClient) AsyncCall(fnName string, param []byte, timeout int64, fn fu
 }
 
 // Register 注册功能函数
-func (d *DRpcClient) Register(fnName, callDoc string, fn func(param []byte) []byte) {
+func (d *DRpcClient) Register(fnName, callDoc string, fn func(param []byte) []byte) error {
 	d.regFunc[fnName] = fn
-	retMsg := DRpcMsg{
+
+	uid := d.createUniqueID()
+	req := DRpcMsg{
 		Type:     TypeReg,
 		FuncName: fnName,
 		Doc:      callDoc,
+		UniqueID: uid,
 	}
-	err := d.conn.WriteJSON(retMsg)
+	_, err := d.call(req)
+	return err
+}
+
+// Sub 订阅
+func (d *DRpcClient) Sub(topic string, fn func(string, error)) {
+	d.topicCallback[topic] = fn
+	param := DRpcMsg{
+		Type:     TypeSub,
+		FuncName: topic,
+	}
+	err := d.conn.WriteJSON(param)
 	if err != nil {
-		log.Println("Register:", err)
+		log.Println("Sub:", err)
 		return
 	}
+}
+
+// Pub 发布
+func (d *DRpcClient) Pub(topic, content string, timeout int64) {
+	param := DRpcMsg{
+		Type:     TypePub,
+		FuncName: topic,
+		Body:     content,
+		Timeout:  timeout,
+	}
+	err := d.conn.WriteJSON(param)
+	if err != nil {
+		log.Println("Pub:", err)
+		return
+	}
+}
+
+func (d *DRpcClient) call(msg DRpcMsg) ([]byte, error) {
+	retChan := make(chan DRpcMsg, 1)
+	d.mu.Lock()
+	d.result[msg.UniqueID] = retChan
+	d.mu.Unlock()
+
+	d.conn.WriteJSON(msg)
+
+	if msg.Timeout == 0 {
+		msg.Timeout = 1000
+	}
+
+	var ret DRpcMsg
+	var err error
+	select {
+	case ret = <-retChan:
+	case <-time.After(time.Millisecond * time.Duration(msg.Timeout*2)):
+		ret.ErrCode = ErrCodeRepTimeout
+		log.Println("timeout ms: ", msg.Timeout)
+	case <-d.stop:
+		return []byte(ret.Body), nil
+	}
+	if ret.ErrCode != ErrCodeOK {
+		err = fmt.Errorf("errCode: %d", ret.ErrCode)
+	}
+	return []byte(ret.Body), err
 }
 
 func (d *DRpcClient) createUniqueID() int64 {
@@ -127,6 +168,15 @@ func (d *DRpcClient) execCallback() {
 	for fn := range d.asyncCache {
 		fn()
 	}
+}
+
+func (d *DRpcClient) recvSub(msg DRpcMsg) {
+	fn, ok := d.topicCallback[msg.FuncName]
+	if !ok {
+		log.Println("not topic: ", msg.FuncName)
+		return
+	}
+	fn(msg.Body, nil)
 }
 
 func (d *DRpcClient) recvCall(msg DRpcMsg) {
@@ -195,6 +245,8 @@ func (d *DRpcClient) read() {
 			d.recvCall(msg)
 		case TypeResp:
 			d.recvResp(msg)
+		case TypeSub:
+			d.recvSub(msg)
 		default:
 			log.Println("unknow type: ", msg)
 		}

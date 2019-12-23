@@ -39,6 +39,12 @@ const (
 	// TypeResp 应答请求
 	TypeResp
 
+	// TypeSub 订阅
+	TypeSub
+
+	// TypePub 发布
+	TypePub
+
 	// TypeUpdateNetAddr 更新网络地址
 	TypeUpdateNetAddr
 )
