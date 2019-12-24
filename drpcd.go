@@ -20,7 +20,7 @@ type DRPC struct {
 	mtxm        sync.Mutex
 
 	// 发布订阅
-	TopicSub map[string]map[chan DRpcMsg]struct{}
+	TopicSub map[string]map[chan DRpcMsg]string
 	mtxt     sync.Mutex
 
 	// WaitResp(mark--timestamp and connnect) 等待应答
@@ -61,7 +61,10 @@ func (d *DRPC) Run(addr string) {
 	http.HandleFunc("/", d.acceptConn)
 	http.HandleFunc("/drpcd/methodsdoc", d.drpcdMethodsDoc)
 	http.HandleFunc("/drpcd/clusteraddrs", d.drpcdClusterAddrs)
+	http.HandleFunc("/drpcd/clustertopics", d.drpcdClusterTopics)
+
 	http.HandleFunc("/drpcd/call", d.httpCall)
+	http.HandleFunc("/drpcd/pub", d.httpPub)
 	go func() {
 		log.Fatal(http.ListenAndServe(addr, nil))
 	}()
@@ -86,7 +89,7 @@ func (d *DRPC) init() {
 	d.WaitResp = make(map[int64]connWait)
 	d.NotifyMember = make([]chan DRpcMsg, 0)
 	d.ClusterAddr = make(map[string]struct{})
-	d.TopicSub = make(map[string]map[chan DRpcMsg]struct{})
+	d.TopicSub = make(map[string]map[chan DRpcMsg]string)
 	d.stop = make(chan struct{})
 }
 
@@ -107,10 +110,23 @@ func (d *DRPC) connectPeer(peerAddr string) error {
 func (d *DRPC) readPeer(c *websocket.Conn, que chan DRpcMsg, done chan struct{}) {
 	d.registerNotify(que)
 	for {
-		_, err := d._readMessage(c, que)
+		ty, err := d._readMessage(c, que)
 		if err != nil {
 			close(done)
 			break
+		}
+		if ty == TypeSub {
+			defer func() {
+				log.Println("regist sub clear func")
+				d.mtxt.Lock()
+				for k, subs := range d.TopicSub {
+					if _, ok := subs[que]; ok {
+						delete(d.TopicSub[k], que)
+						log.Println("delete topic a sub: ", k)
+					}
+				}
+				d.mtxt.Unlock()
+			}()
 		}
 		select {
 		case <-d.stop:
@@ -199,6 +215,17 @@ func (d *DRPC) drpcdClusterAddrs(w http.ResponseWriter, r *http.Request) {
 	w.Write(info)
 }
 
+func (d *DRPC) drpcdClusterTopics(w http.ResponseWriter, r *http.Request) {
+	info := make(map[string][]string)
+	for topic, clis := range d.TopicSub {
+		for _, addr := range clis {
+			info[topic] = append(info[topic], addr)
+		}
+	}
+	msg, _ := json.MarshalIndent(info, " ", "	")
+	w.Write(msg)
+}
+
 func (d *DRPC) drpcdMethodsDoc(w http.ResponseWriter, r *http.Request) {
 	info, _ := json.MarshalIndent(d.MethodDoc, " ", "	")
 	w.Write(info)
@@ -231,6 +258,33 @@ func (d *DRPC) httpCall(w http.ResponseWriter, r *http.Request) {
 
 	httpResp.Body = msg.Body
 	httpResp.ErrCode = msg.ErrCode
+	resp, _ := json.Marshal(httpResp)
+	w.Write(resp)
+}
+
+func (d *DRPC) httpPub(w http.ResponseWriter, r *http.Request) {
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return
+	}
+	defer r.Body.Close()
+
+	var httpResp DRpcMsgHTTP
+
+	var msg DRpcMsg
+	err = json.Unmarshal(body, &msg)
+	if err != nil {
+		httpResp.ErrCode = ErrCodeParamFormatError
+		resp, _ := json.Marshal(httpResp)
+		w.Write(resp)
+		return
+	}
+	msg.Type = TypePub
+
+	que := make(chan DRpcMsg, 1)
+	d.pub(msg, que)
+
+	httpResp.ErrCode = ErrCodeOK
 	resp, _ := json.Marshal(httpResp)
 	w.Write(resp)
 }
@@ -348,7 +402,7 @@ func (d *DRPC) _readMessage(c *websocket.Conn, que chan DRpcMsg) (int, error) {
 		d.update(msg)
 	case TypeSub:
 		log.Println("recv TypeSub")
-		d.sub(msg, que)
+		d.sub(c.RemoteAddr().String(), msg, que)
 	case TypePub:
 		d.pub(msg, que)
 	}
@@ -362,6 +416,14 @@ func (d *DRPC) regNotify(msg DRpcMsg, que chan DRpcMsg) {
 	for _, name := range nameList {
 		m := DRpcMsg{
 			Type:     TypeReg,
+			FuncName: name,
+		}
+		que <- m
+	}
+	topicList := d.getAllSubTopic()
+	for _, name := range topicList {
+		m := DRpcMsg{
+			Type:     TypeSub,
 			FuncName: name,
 		}
 		que <- m
@@ -392,6 +454,16 @@ func (d *DRPC) getAllRegFnName() []string {
 		nameList = append(nameList, fnName)
 	}
 	return nameList
+}
+
+func (d *DRPC) getAllSubTopic() []string {
+	d.mtxt.Lock()
+	defer d.mtxt.Unlock()
+	var topicList []string
+	for topic := range d.TopicSub {
+		topicList = append(topicList, topic)
+	}
+	return topicList
 }
 
 func (d *DRPC) notify(msg DRpcMsg, curQue chan DRpcMsg) {
@@ -495,15 +567,15 @@ func (d *DRPC) resp(msg DRpcMsg) {
 	ct.conn <- msg
 }
 
-func (d *DRPC) sub(msg DRpcMsg, que chan DRpcMsg) {
+func (d *DRPC) sub(subAddr string, msg DRpcMsg, que chan DRpcMsg) {
 	d.mtxt.Lock()
 	defer d.mtxt.Unlock()
 
 	if _, ok := d.TopicSub[msg.FuncName]; !ok {
-		d.TopicSub[msg.FuncName] = make(map[chan DRpcMsg]struct{})
+		d.TopicSub[msg.FuncName] = make(map[chan DRpcMsg]string)
 	}
 	d.notify(msg, que)
-	d.TopicSub[msg.FuncName][que] = struct{}{}
+	d.TopicSub[msg.FuncName][que] = subAddr
 }
 
 func (d *DRPC) pub(msg DRpcMsg, que chan DRpcMsg) {
