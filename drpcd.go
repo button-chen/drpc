@@ -18,21 +18,24 @@ type ConnMsgQue = chan DRpcMsg
 
 // DRPC 分布式rpc
 type DRPC struct {
+	
+	// MethodOwner 注册提供者集合
 	MethodOwner *Provider
-	// 发布订阅
-	TopicSub map[string]map[ConnMsgQue]string
-	mtxt     sync.Mutex
 
-	// WaitResp 正在等待应答
+	// WaitResp 等待应答集合
 	WaitResp *WaitGroup
 
+	// 发布订阅
+	TopicSub *Subscribe
+
 	// 有注册到来需要通知的集群成员
-	NotifyMember []ConnMsgQue
+	NotifyMember map[ConnMsgQue]struct{}
+	mu sync.RWMutex
 
 	// 集群相关
 	// 当前集群中的地址  ip:port 用于当自己和集群的连接
 	// 断了，顺序找一个可以连接的加入集群
-	ClusterAddr map[string]struct{}
+	ClusterAddr sync.Map
 	// 监听地址
 	addr string
 
@@ -59,13 +62,14 @@ func (d *DRPC) Run(addr string) {
 		log.Fatal(http.ListenAndServe(addr, nil))
 	}()
 	d.addr = addr
+	go d.deleteTimeout()
 }
 
 // RunPeer 启动服务并且连接到集群
 func (d *DRPC) RunPeer(addr, peerAddr string) {
 	d.Run(addr)
 	d.connectPeer(peerAddr)
-	d.ClusterAddr[peerAddr] = struct{}{}
+	d.ClusterAddr.Store(peerAddr, nil)
 }
 
 // Stop 停止服务
@@ -76,10 +80,10 @@ func (d *DRPC) Stop() {
 func (d *DRPC) init() {
 	d.MethodOwner = NewProvider()
 	d.WaitResp = NewWaitGroup(runtime.NumCPU())
+	d.TopicSub = NewSubscribe()
 
-	d.NotifyMember = make([]ConnMsgQue, 0)
-	d.ClusterAddr = make(map[string]struct{})
-	d.TopicSub = make(map[string]map[ConnMsgQue]string)
+	d.NotifyMember = make(map[ConnMsgQue]struct{})
+
 	d.stop = make(chan struct{})
 }
 
@@ -91,60 +95,20 @@ func (d *DRPC) connectPeer(peerAddr string) error {
 		return err
 	}
 	que := make(ConnMsgQue, 1024)
-	done := make(chan struct{})
-	go d.readPeer(c, que, done)
-	go d.writeMessage(c, que, done)
+	go d.readPeer(c, que)
+	go d.writeMessage(c, que)
 	return nil
-}
-
-func (d *DRPC) readPeer(c *websocket.Conn, que ConnMsgQue, done chan struct{}) {
-	d.registerNotify(que)
-	for {
-		ty, err := d._readMessage(c, que)
-		if err != nil {
-			close(done)
-			break
-		}
-		if ty == TypeSub {
-			defer func() {
-				log.Println("regist sub clear func")
-				d.mtxt.Lock()
-				for k, subs := range d.TopicSub {
-					if _, ok := subs[que]; ok {
-						delete(d.TopicSub[k], que)
-						log.Println("delete topic a sub: ", k)
-					}
-				}
-				d.mtxt.Unlock()
-			}()
-		}
-		select {
-		case <-d.stop:
-			return
-		case <-done:
-			return
-		default:
-		}
-	}
-	// 找到一个可以连接的兄弟
-	for addr := range d.ClusterAddr {
-		if addr == d.addr {
-			continue
-		}
-		if d.connectPeer(addr) == nil {
-			log.Println("try connect peer success ", addr)
-			break
-		}
-	}
 }
 
 // registerNotify 注册功能通知函数, 集群之间使用
 func (d *DRPC) registerNotify(que ConnMsgQue) {
 	// 把自己拥有的兄弟网络信息给对方
 	var vTmp []string
-	for addr := range d.ClusterAddr {
+	d.ClusterAddr.Range(func(key interface{}, value interface{}) bool {
+		addr := key.(string)
 		vTmp = append(vTmp, addr)
-	}
+		return true
+	})
 	// 自己的监听地址也加进去
 	vTmp = append(vTmp, d.addr)
 
@@ -160,7 +124,10 @@ func (d *DRPC) registerNotify(que ConnMsgQue) {
 }
 
 func (d *DRPC) updateClusterNetAddrs(netAddrInfo string) {
-	for _, que := range d.NotifyMember {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	for que := range d.NotifyMember {
 		msg := DRpcMsg{
 			Type: TypeUpdateNetAddr,
 			Body: netAddrInfo,
@@ -170,7 +137,6 @@ func (d *DRPC) updateClusterNetAddrs(netAddrInfo string) {
 		case <-time.After(time.Second):
 			log.Println("TypeUpdateNetAddr timeout")
 		}
-		que <- msg
 	}
 }
 
@@ -183,21 +149,20 @@ var upgrader = websocket.Upgrader{
 func (d *DRPC) acceptConn(w http.ResponseWriter, r *http.Request) {
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Print("upgrade:", err)
 		return
 	}
 	que := make(ConnMsgQue, 1024)
-	done := make(chan struct{})
-	go d.readMessage(c, que, done)
-	go d.writeMessage(c, que, done)
-	go d.timeoutDelete()
+	go d.readMessage(c, que)
+	go d.writeMessage(c, que)
 }
 
 func (d *DRPC) drpcdClusterAddrs(w http.ResponseWriter, r *http.Request) {
 	var netAddrs []string
-	for addr := range d.ClusterAddr {
+	d.ClusterAddr.Range(func(key interface{}, value interface{}) bool {
+		addr := key.(string)
 		netAddrs = append(netAddrs, addr)
-	}
+		return true
+	})
 	if len(netAddrs) == 0 {
 		netAddrs = append(netAddrs, d.addr)
 	}
@@ -206,18 +171,10 @@ func (d *DRPC) drpcdClusterAddrs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DRPC) drpcdClusterTopics(w http.ResponseWriter, r *http.Request) {
-	info := make(map[string][]string)
-	for topic, clis := range d.TopicSub {
-		for _, addr := range clis {
-			info[topic] = append(info[topic], addr)
-		}
-	}
-	msg, _ := json.MarshalIndent(info, " ", "	")
-	w.Write(msg)
+	w.Write(d.TopicSub.Info())
 }
 
 func (d *DRPC) drpcdMethodsDoc(w http.ResponseWriter, r *http.Request) {
-
 	w.Write(d.MethodOwner.Docs())
 }
 
@@ -284,12 +241,12 @@ func (d *DRPC) httpPub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg.Type = TypePub
-	d.pub(msg, nil)
+	d.pub(msg, r.RemoteAddr)
 
 	w.Write(d.httpError(ErrCodeOK, ""))
 }
 
-func (d *DRPC) timeoutDelete() {
+func (d *DRPC) deleteTimeout() {
 
 	duration := time.Millisecond * 500
 	timer := time.NewTimer(duration)
@@ -305,47 +262,119 @@ func (d *DRPC) timeoutDelete() {
 	}
 }
 
-func (d *DRPC) writeMessage(c *websocket.Conn, que ConnMsgQue, done chan struct{}) {
+func (d *DRPC) writeMessage(c *websocket.Conn, que ConnMsgQue) {
 	for {
 		select {
-		case msg := <-que:
-			c.WriteJSON(msg)
-
-		case <-done:
-			return
+		case msg, ok := <-que:
+			err := c.WriteJSON(msg)
+			if err != nil || !ok {
+				return
+			}
 		case <-d.stop:
 			return
 		}
 	}
 }
 
-func (d *DRPC) readMessage(c *websocket.Conn, que ConnMsgQue, done chan struct{}) {
+func (d *DRPC) delNotifyMember(que ConnMsgQue) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	delete(d.NotifyMember, que)
+	close(que)
+}
+
+func (d *DRPC) getNotifyCount() int{
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return len(d.NotifyMember)
+}
+
+func (d *DRPC) readPeer(c *websocket.Conn, que ConnMsgQue) {
+
+	types := make(map[int]struct{})
+	d.registerNotify(que)
 	for {
 		ty, err := d._readMessage(c, que)
+		types[ty] = struct{}{}
 		if err != nil {
-			close(done)
+			if _, ok := types[TypeSub]; ok {
+				d.TopicSub.Del("", c.RemoteAddr().String())
+				msg := DRpcMsg{Type:TypeUnSub}
+				d.notify(msg, que)
+			}
+			d.delNotifyMember(que)
 			break
 		}
-		if ty == TypeRegNotify {
-			// 收到注册的同时也需要注册到对方
+		select {
+		case <-d.stop:
+			return
+		default:
+		}
+	}
+	// 如果此时和集群还有关系就不需要去主动连接
+	if d.getNotifyCount() > 0 {
+		log.Println("exist valid connect from other member")
+		return
+	}
+	// 找到一个可以连接的兄弟
+	d.ClusterAddr.Range(func(key interface{}, value interface{}) bool {
+		addr := key.(string)
+		if addr == d.addr {
+			return true
+		}
+		// 这里有时机问题，当 A -> B   B->A  同时连上，就形成了环， 怎么搞？
+		if d.getNotifyCount() > 0 {
+			log.Println("new valid connect from other member, not try connect")
+			return false
+		}
+		if d.connectPeer(addr) != nil {
+			return true
+		}
+		log.Println("try connect peer success ", addr)
+		return false
+	})
+}
+
+func (d *DRPC) readMessage(c *websocket.Conn, que ConnMsgQue) {
+
+	types := make(map[int]bool)
+	for {
+		ty, err := d._readMessage(c, que)
+		if _, ok := types[ty]; !ok {
+			types[ty] = false
+		}
+		if err != nil {
+			if _, ok := types[TypeSub]; ok {
+				d.TopicSub.Del("", c.RemoteAddr().String())
+				msg := DRpcMsg{Type:TypeUnSub}
+				d.notify(msg, que)
+			}
+			if _, ok := types[TypeReg]; ok {
+				fnNames := d.MethodOwner.DelByQue(que)
+				for _, fnName := range fnNames {
+					msg := DRpcMsg{
+						Type:     TypeUnReg,
+						FuncName: fnName,
+					}
+					log.Println("disconnect TypeUnReg", fnName)
+					d.notify(msg, que)
+				}
+			}
+			d.delNotifyMember(que)
+			break
+		}
+		// 收到注册的同时也需要注册到对方
+		switch ty {
+		case TypeRegNotify:
+			if types[ty] {
+				continue
+			}
+			types[ty] = true
 			d.registerNotify(que)
 		}
-		if ty == TypeSub {
-			defer func() {
-				log.Println("regist sub clear func")
-				d.mtxt.Lock()
-				for k, subs := range d.TopicSub {
-					if _, ok := subs[que]; ok {
-						delete(d.TopicSub[k], que)
-						log.Println("delete topic a sub: ", k)
-					}
-				}
-				d.mtxt.Unlock()
-			}()
-		}
 		select {
-		case <-done:
-			return
 		case <-d.stop:
 			return
 		default:
@@ -356,10 +385,6 @@ func (d *DRPC) readMessage(c *websocket.Conn, que ConnMsgQue, done chan struct{}
 func (d *DRPC) _readMessage(c *websocket.Conn, que ConnMsgQue) (int, error) {
 	mt, message, err := c.ReadMessage()
 	if err != nil {
-		fnNames := d.del(que)
-		for _, fnName := range fnNames {
-			d.unRegNotify(fnName)
-		}
 		return TypeUnknow, err
 	}
 	// 所有的通讯都是基于json协议
@@ -385,32 +410,38 @@ func (d *DRPC) _readMessage(c *websocket.Conn, que ConnMsgQue) (int, error) {
 		log.Println("recv TypeRegNotify")
 		d.regNotify(msg, que)
 	case TypeUnReg:
-		log.Println("recv TypeUnReg")
-		d.unReg(msg)
+		log.Println("recv TypeUnReg", msg.FuncName)
+		d.unReg(msg, que)
 	case TypeUpdateNetAddr:
 		log.Println("recv TypeUpdateNetAddr")
 		d.update(msg)
 	case TypeSub:
 		log.Println("recv TypeSub")
 		d.sub(c.RemoteAddr().String(), msg, que)
+	case TypeUnSub:
+		log.Println("recv TypeUnSub")
+		d.unSub(c.RemoteAddr().String(), msg, que)
 	case TypePub:
-		d.pub(msg, que)
+		d.pub(msg, c.RemoteAddr().String())
 	}
 	return msg.Type, nil
 }
 
 func (d *DRPC) regNotify(msg DRpcMsg, que ConnMsgQue) {
-	d.NotifyMember = append(d.NotifyMember, que)
+	d.mu.Lock()
+	d.NotifyMember[que] = struct{}{}
+	d.mu.Unlock()
 	// 收到有集群成员注册通知， 一开始就把所有的注册函数给它
-	nameList := d.MethodOwner.Methods()
-	for _, name := range nameList {
+	ms, docs := d.MethodOwner.Methods()
+	for i, name := range ms {
 		m := DRpcMsg{
 			Type:     TypeReg,
 			FuncName: name,
+			Doc:docs[i],
 		}
 		que <- m
 	}
-	topicList := d.getAllSubTopic()
+	topicList := d.TopicSub.Topics()
 	for _, name := range topicList {
 		m := DRpcMsg{
 			Type:     TypeSub,
@@ -422,32 +453,15 @@ func (d *DRPC) regNotify(msg DRpcMsg, que ConnMsgQue) {
 	var netAddrs []string
 	json.Unmarshal([]byte(msg.Body), &netAddrs)
 	for _, addr := range netAddrs {
-		d.ClusterAddr[addr] = struct{}{}
+		d.ClusterAddr.Store(addr, nil)
 	}
-}
-
-func (d *DRPC) unRegNotify(fnName string) {
-	m := DRpcMsg{
-		Type:     TypeUnReg,
-		FuncName: fnName,
-	}
-	for _, que := range d.NotifyMember {
-		que <- m
-	}
-}
-
-func (d *DRPC) getAllSubTopic() []string {
-	d.mtxt.Lock()
-	defer d.mtxt.Unlock()
-	var topicList []string
-	for topic := range d.TopicSub {
-		topicList = append(topicList, topic)
-	}
-	return topicList
 }
 
 func (d *DRPC) notify(msg DRpcMsg, curQue ConnMsgQue) {
-	for _, que := range d.NotifyMember {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	for que := range d.NotifyMember {
 		if que == curQue {
 			continue
 		}
@@ -471,9 +485,9 @@ func (d *DRPC) reg(msg DRpcMsg, que ConnMsgQue) {
 	d.writeError(msg, que)
 }
 
-func (d *DRPC) unReg(msg DRpcMsg) {
-
+func (d *DRPC) unReg(msg DRpcMsg, que ConnMsgQue) {
 	d.MethodOwner.Del(msg.FuncName)
+	d.notify(msg, que)
 }
 
 func (d *DRPC) update(msg DRpcMsg) {
@@ -481,7 +495,7 @@ func (d *DRPC) update(msg DRpcMsg) {
 	json.Unmarshal([]byte(msg.Body), &netAddrs)
 
 	for _, addr := range netAddrs {
-		d.ClusterAddr[addr] = struct{}{}
+		d.ClusterAddr.Store(addr, nil)
 	}
 }
 
@@ -505,39 +519,22 @@ func (d *DRPC) resp(msg DRpcMsg) {
 }
 
 func (d *DRPC) del(que ConnMsgQue) []string {
-
 	return d.MethodOwner.DelByQue(que)
 }
 
 func (d *DRPC) sub(subAddr string, msg DRpcMsg, que ConnMsgQue) {
-	d.mtxt.Lock()
-	defer d.mtxt.Unlock()
-
-	if _, ok := d.TopicSub[msg.FuncName]; !ok {
-		d.TopicSub[msg.FuncName] = make(map[ConnMsgQue]string)
-	}
+	d.TopicSub.Sub(msg.FuncName, subAddr, que)
 	d.notify(msg, que)
-	d.TopicSub[msg.FuncName][que] = subAddr
 }
 
-func (d *DRPC) pub(msg DRpcMsg, que ConnMsgQue) {
-	d.mtxt.Lock()
-	defer d.mtxt.Unlock()
+func (d *DRPC) unSub(subAddr string, msg DRpcMsg, que ConnMsgQue) {
+	d.TopicSub.Del(msg.FuncName, subAddr)
+	d.notify(msg, que)
+}
 
-	subs, ok := d.TopicSub[msg.FuncName]
-	if !ok {
-		return
-	}
-	for sub := range subs {
-		if que == sub {
-			continue
-		}
-		select {
-		case sub <- msg:
-		case <-time.After(time.Millisecond * time.Duration(msg.Timeout)):
-			log.Println("publish timeout: ", msg.Timeout)
-		}
-	}
+func (d *DRPC) pub(msg DRpcMsg, addr string) {
+
+	d.TopicSub.Pub(msg, addr)
 }
 
 func (d *DRPC) writeError(msg DRpcMsg, que ConnMsgQue) {

@@ -78,15 +78,17 @@ func (p *Provider) DelByQue(que ConnMsgQue) []string {
 }
 
 // Methods method
-func (p *Provider) Methods() []string {
+func (p *Provider) Methods() ([]string, []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	ms := make([]string, 0, len(p.MethodOwner))
+	docs := make([]string, 0, len(p.MethodOwner))
 	for fnName := range p.MethodOwner {
 		ms = append(ms, fnName)
+		docs = append(docs, p.MethodDoc[fnName])
 	}
-	return ms
+	return ms, docs
 }
 
 // Docs method

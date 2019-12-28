@@ -45,6 +45,9 @@ const (
 	// TypeSub 订阅
 	TypeSub
 
+	// TypeUnSub 取消订阅
+	TypeUnSub
+
 	// TypePub 发布
 	TypePub
 
