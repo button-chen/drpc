@@ -6,29 +6,28 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+// ConnMsgQue 网络连接消息队列
+type ConnMsgQue = chan DRpcMsg
+
 // DRPC 分布式rpc
 type DRPC struct {
-	// 所有已经注册的方法名
-	MethodOwner map[string]chan DRpcMsg
-	MethodDoc   map[string]string
-	mtxm        sync.Mutex
-
+	MethodOwner *Provider
 	// 发布订阅
-	TopicSub map[string]map[chan DRpcMsg]string
+	TopicSub map[string]map[ConnMsgQue]string
 	mtxt     sync.Mutex
 
-	// WaitResp(mark--timestamp and connnect) 等待应答
-	WaitResp map[int64]connWait
-	mtxw     sync.Mutex
+	// WaitResp 正在等待应答
+	WaitResp *WaitGroup
 
 	// 有注册到来需要通知的集群成员
-	NotifyMember []chan DRpcMsg
+	NotifyMember []ConnMsgQue
 
 	// 集群相关
 	// 当前集群中的地址  ip:port 用于当自己和集群的连接
@@ -40,14 +39,6 @@ type DRPC struct {
 	stop chan struct{}
 }
 
-type connWait struct {
-	// 创建时间
-	createTm time.Time
-	// 原始消息
-	msg  DRpcMsg
-	conn chan DRpcMsg
-}
-
 // NewDRPC 新建
 func NewDRPC() *DRPC {
 	rpc := &DRPC{}
@@ -57,7 +48,6 @@ func NewDRPC() *DRPC {
 
 // Run 启动服务
 func (d *DRPC) Run(addr string) {
-	d.init()
 	http.HandleFunc("/", d.acceptConn)
 	http.HandleFunc("/drpcd/methodsdoc", d.drpcdMethodsDoc)
 	http.HandleFunc("/drpcd/clusteraddrs", d.drpcdClusterAddrs)
@@ -84,12 +74,12 @@ func (d *DRPC) Stop() {
 }
 
 func (d *DRPC) init() {
-	d.MethodOwner = make(map[string]chan DRpcMsg)
-	d.MethodDoc = make(map[string]string)
-	d.WaitResp = make(map[int64]connWait)
-	d.NotifyMember = make([]chan DRpcMsg, 0)
+	d.MethodOwner = NewProvider()
+	d.WaitResp = NewWaitGroup(runtime.NumCPU())
+
+	d.NotifyMember = make([]ConnMsgQue, 0)
 	d.ClusterAddr = make(map[string]struct{})
-	d.TopicSub = make(map[string]map[chan DRpcMsg]string)
+	d.TopicSub = make(map[string]map[ConnMsgQue]string)
 	d.stop = make(chan struct{})
 }
 
@@ -100,14 +90,14 @@ func (d *DRPC) connectPeer(peerAddr string) error {
 		log.Println("dial peer:", err)
 		return err
 	}
-	que := make(chan DRpcMsg, 512)
+	que := make(ConnMsgQue, 1024)
 	done := make(chan struct{})
 	go d.readPeer(c, que, done)
 	go d.writeMessage(c, que, done)
 	return nil
 }
 
-func (d *DRPC) readPeer(c *websocket.Conn, que chan DRpcMsg, done chan struct{}) {
+func (d *DRPC) readPeer(c *websocket.Conn, que ConnMsgQue, done chan struct{}) {
 	d.registerNotify(que)
 	for {
 		ty, err := d._readMessage(c, que)
@@ -149,7 +139,7 @@ func (d *DRPC) readPeer(c *websocket.Conn, que chan DRpcMsg, done chan struct{})
 }
 
 // registerNotify 注册功能通知函数, 集群之间使用
-func (d *DRPC) registerNotify(que chan DRpcMsg) {
+func (d *DRPC) registerNotify(que ConnMsgQue) {
 	// 把自己拥有的兄弟网络信息给对方
 	var vTmp []string
 	for addr := range d.ClusterAddr {
@@ -196,7 +186,7 @@ func (d *DRPC) acceptConn(w http.ResponseWriter, r *http.Request) {
 		log.Print("upgrade:", err)
 		return
 	}
-	que := make(chan DRpcMsg, 512)
+	que := make(ConnMsgQue, 1024)
 	done := make(chan struct{})
 	go d.readMessage(c, que, done)
 	go d.writeMessage(c, que, done)
@@ -227,95 +217,95 @@ func (d *DRPC) drpcdClusterTopics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *DRPC) drpcdMethodsDoc(w http.ResponseWriter, r *http.Request) {
-	info, _ := json.MarshalIndent(d.MethodDoc, " ", "	")
-	w.Write(info)
+
+	w.Write(d.MethodOwner.Docs())
+}
+
+func (d *DRPC) httpError(errCode int, errMsg string) []byte {
+
+	errReps := struct {
+		ErrCode int
+		ErrMsg  string
+	}{
+		errCode,
+		errMsg,
+	}
+	msg, _ := json.Marshal(errReps)
+	return msg
 }
 
 func (d *DRPC) httpCall(w http.ResponseWriter, r *http.Request) {
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
+		w.Write(d.httpError(ErrCodeUnknow, err.Error()))
 		return
 	}
 	defer r.Body.Close()
 
-	var httpResp DRpcMsgHTTP
-
 	var msg DRpcMsg
 	err = json.Unmarshal(body, &msg)
 	if err != nil {
-		httpResp.ErrCode = ErrCodeParamFormatError
-		resp, _ := json.Marshal(httpResp)
-		w.Write(resp)
+		w.Write(d.httpError(ErrCodeParamFormatError, err.Error()))
 		return
 	}
+	// 构造请求参数
 	msg.Type = TypeCall
 	msg.UniqueID = time.Now().UnixNano()
-
-	que := make(chan DRpcMsg, 1)
+	if msg.Timeout == 0 {
+		// 超时没有赋值，默认给5秒
+		msg.Timeout = 5000
+	}
+	que := make(ConnMsgQue, 1)
 	d.call(msg, que)
+	// 等待结果
+	select {
+	case msg = <-que:
+	case <-time.After(time.Millisecond * time.Duration(msg.Timeout)):
+		msg.ErrCode = ErrCodeRepTimeout
+		msg.Body = "请求超时"
+		log.Println("http call timeout: ", msg.Timeout)
+	}
 
-	msg = <-que
-
-	httpResp.Body = msg.Body
-	httpResp.ErrCode = msg.ErrCode
-	resp, _ := json.Marshal(httpResp)
-	w.Write(resp)
+	w.Write(d.httpError(msg.ErrCode, msg.Body))
 }
 
 func (d *DRPC) httpPub(w http.ResponseWriter, r *http.Request) {
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
+		w.Write(d.httpError(ErrCodeUnknow, err.Error()))
 		return
 	}
 	defer r.Body.Close()
 
-	var httpResp DRpcMsgHTTP
-
 	var msg DRpcMsg
 	err = json.Unmarshal(body, &msg)
 	if err != nil {
-		httpResp.ErrCode = ErrCodeParamFormatError
-		resp, _ := json.Marshal(httpResp)
-		w.Write(resp)
+		w.Write(d.httpError(ErrCodeParamFormatError, err.Error()))
 		return
 	}
 	msg.Type = TypePub
+	d.pub(msg, nil)
 
-	que := make(chan DRpcMsg, 1)
-	d.pub(msg, que)
-
-	httpResp.ErrCode = ErrCodeOK
-	resp, _ := json.Marshal(httpResp)
-	w.Write(resp)
+	w.Write(d.httpError(ErrCodeOK, ""))
 }
 
 func (d *DRPC) timeoutDelete() {
-	ticker := time.NewTicker(500 * time.Millisecond)
+
+	duration := time.Millisecond * 500
+	timer := time.NewTimer(duration)
 	for {
 		select {
-		case <-ticker.C:
-			curTm := time.Now()
-			d.mtxw.Lock()
-			for id, ct := range d.WaitResp {
-				if curTm.Sub(ct.createTm).Milliseconds() < ct.msg.Timeout {
-					continue
-				}
-				delete(d.WaitResp, id)
-				log.Println("timeout id: ", id)
-				msg := ct.msg
-				msg.ErrCode = ErrCodeRepTimeout
-				d.writeError(msg, ct.conn)
-			}
-			d.mtxw.Unlock()
+		case <-timer.C:
+			d.WaitResp.ClearExpired()
+			timer.Reset(duration)
 
 		case <-d.stop:
-			ticker.Stop()
 			return
 		}
 	}
 }
 
-func (d *DRPC) writeMessage(c *websocket.Conn, que chan DRpcMsg, done chan struct{}) {
+func (d *DRPC) writeMessage(c *websocket.Conn, que ConnMsgQue, done chan struct{}) {
 	for {
 		select {
 		case msg := <-que:
@@ -329,7 +319,7 @@ func (d *DRPC) writeMessage(c *websocket.Conn, que chan DRpcMsg, done chan struc
 	}
 }
 
-func (d *DRPC) readMessage(c *websocket.Conn, que chan DRpcMsg, done chan struct{}) {
+func (d *DRPC) readMessage(c *websocket.Conn, que ConnMsgQue, done chan struct{}) {
 	for {
 		ty, err := d._readMessage(c, que)
 		if err != nil {
@@ -363,7 +353,7 @@ func (d *DRPC) readMessage(c *websocket.Conn, que chan DRpcMsg, done chan struct
 	}
 }
 
-func (d *DRPC) _readMessage(c *websocket.Conn, que chan DRpcMsg) (int, error) {
+func (d *DRPC) _readMessage(c *websocket.Conn, que ConnMsgQue) (int, error) {
 	mt, message, err := c.ReadMessage()
 	if err != nil {
 		fnNames := d.del(que)
@@ -409,10 +399,10 @@ func (d *DRPC) _readMessage(c *websocket.Conn, que chan DRpcMsg) (int, error) {
 	return msg.Type, nil
 }
 
-func (d *DRPC) regNotify(msg DRpcMsg, que chan DRpcMsg) {
+func (d *DRPC) regNotify(msg DRpcMsg, que ConnMsgQue) {
 	d.NotifyMember = append(d.NotifyMember, que)
 	// 收到有集群成员注册通知， 一开始就把所有的注册函数给它
-	nameList := d.getAllRegFnName()
+	nameList := d.MethodOwner.Methods()
 	for _, name := range nameList {
 		m := DRpcMsg{
 			Type:     TypeReg,
@@ -446,16 +436,6 @@ func (d *DRPC) unRegNotify(fnName string) {
 	}
 }
 
-func (d *DRPC) getAllRegFnName() []string {
-	d.mtxm.Lock()
-	defer d.mtxm.Unlock()
-	var nameList []string
-	for fnName := range d.MethodDoc {
-		nameList = append(nameList, fnName)
-	}
-	return nameList
-}
-
 func (d *DRPC) getAllSubTopic() []string {
 	d.mtxt.Lock()
 	defer d.mtxt.Unlock()
@@ -466,7 +446,7 @@ func (d *DRPC) getAllSubTopic() []string {
 	return topicList
 }
 
-func (d *DRPC) notify(msg DRpcMsg, curQue chan DRpcMsg) {
+func (d *DRPC) notify(msg DRpcMsg, curQue ConnMsgQue) {
 	for _, que := range d.NotifyMember {
 		if que == curQue {
 			continue
@@ -479,15 +459,10 @@ func (d *DRPC) notify(msg DRpcMsg, curQue chan DRpcMsg) {
 	}
 }
 
-func (d *DRPC) reg(msg DRpcMsg, que chan DRpcMsg) {
-	d.mtxm.Lock()
-	defer d.mtxm.Unlock()
-	if _, ok := d.MethodOwner[msg.FuncName]; !ok {
-		d.MethodOwner[msg.FuncName] = que
-		d.MethodDoc[msg.FuncName] = msg.Doc
+func (d *DRPC) reg(msg DRpcMsg, que ConnMsgQue) {
 
+	if d.MethodOwner.Add(msg.FuncName, msg.Doc, que) {
 		d.notify(msg, que)
-
 		msg.ErrCode = ErrCodeOK
 		d.writeError(msg, que)
 		return
@@ -497,10 +472,8 @@ func (d *DRPC) reg(msg DRpcMsg, que chan DRpcMsg) {
 }
 
 func (d *DRPC) unReg(msg DRpcMsg) {
-	d.mtxm.Lock()
-	delete(d.MethodOwner, msg.FuncName)
-	delete(d.MethodDoc, msg.FuncName)
-	d.mtxm.Unlock()
+
+	d.MethodOwner.Del(msg.FuncName)
 }
 
 func (d *DRPC) update(msg DRpcMsg) {
@@ -512,73 +485,42 @@ func (d *DRPC) update(msg DRpcMsg) {
 	}
 }
 
-func (d *DRPC) call(msg DRpcMsg, que chan DRpcMsg) {
-	d.mtxm.Lock()
-	otherQue, ok := d.MethodOwner[msg.FuncName]
-	d.mtxm.Unlock()
-	if !ok {
+func (d *DRPC) call(msg DRpcMsg, que ConnMsgQue) {
+
+	if !d.MethodOwner.Call(msg) {
 		msg.ErrCode = ErrCodeFunctionNotExist
 		d.writeError(msg, que)
 		return
 	}
-	otherQue <- msg
-
-	d.mtxw.Lock()
-	d.WaitResp[msg.UniqueID] = connWait{time.Now(), msg, que}
-	d.mtxw.Unlock()
-}
-
-func (d *DRPC) del(que chan DRpcMsg) []string {
-	fnNames := make([]string, 0)
-	d.mtxm.Lock()
-	for fnName, conn := range d.MethodOwner {
-		if que == conn {
-			delete(d.MethodOwner, fnName)
-			delete(d.MethodDoc, fnName)
-			fnNames = append(fnNames, fnName)
-		}
-	}
-	d.mtxm.Unlock()
-
-	d.mtxw.Lock()
-	for id, ct := range d.WaitResp {
-		if ct.conn == que {
-			delete(d.WaitResp, id)
-		}
-	}
-	d.mtxw.Unlock()
-
-	d.mtxt.Lock()
-
-	d.mtxt.Unlock()
-
-	return fnNames
+	d.WaitResp.Get(msg.UniqueID).Add(msg.UniqueID, WaitVal{time.Now(), msg, que})
 }
 
 func (d *DRPC) resp(msg DRpcMsg) {
-	d.mtxw.Lock()
-	defer d.mtxw.Unlock()
-	ct, ok := d.WaitResp[msg.UniqueID]
+	ct, ok := d.WaitResp.Get(msg.UniqueID).GetAndDel(msg.UniqueID)
 	if !ok {
 		return
 	}
-	delete(d.WaitResp, msg.UniqueID)
-
+	msg.Type = TypeResp
 	ct.conn <- msg
 }
 
-func (d *DRPC) sub(subAddr string, msg DRpcMsg, que chan DRpcMsg) {
+func (d *DRPC) del(que ConnMsgQue) []string {
+
+	return d.MethodOwner.DelByQue(que)
+}
+
+func (d *DRPC) sub(subAddr string, msg DRpcMsg, que ConnMsgQue) {
 	d.mtxt.Lock()
 	defer d.mtxt.Unlock()
 
 	if _, ok := d.TopicSub[msg.FuncName]; !ok {
-		d.TopicSub[msg.FuncName] = make(map[chan DRpcMsg]string)
+		d.TopicSub[msg.FuncName] = make(map[ConnMsgQue]string)
 	}
 	d.notify(msg, que)
 	d.TopicSub[msg.FuncName][que] = subAddr
 }
 
-func (d *DRPC) pub(msg DRpcMsg, que chan DRpcMsg) {
+func (d *DRPC) pub(msg DRpcMsg, que ConnMsgQue) {
 	d.mtxt.Lock()
 	defer d.mtxt.Unlock()
 
@@ -598,7 +540,7 @@ func (d *DRPC) pub(msg DRpcMsg, que chan DRpcMsg) {
 	}
 }
 
-func (d *DRPC) writeError(msg DRpcMsg, que chan DRpcMsg) {
+func (d *DRPC) writeError(msg DRpcMsg, que ConnMsgQue) {
 	msg.Type = TypeResp
 	que <- msg
 }

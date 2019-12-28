@@ -18,6 +18,9 @@ const (
 
 	// ErrCodeFunctionBeRegistered 功能已经被注册
 	ErrCodeFunctionBeRegistered
+
+	// ErrCodeUnknow 未知错误
+	ErrCodeUnknow
 )
 
 const (
@@ -76,14 +79,4 @@ type DRpcMsg struct {
 
 	// 注册的情况下功能调用与返回值描述
 	Doc string
-}
-
-// DRpcMsgHTTP 客户端是http
-type DRpcMsgHTTP struct {
-
-	// ErrCode 错误代码，一般是应答方赋值
-	ErrCode int
-
-	// 请求调用时是参数，应答时是返回值，一般是json格式
-	Body string
 }
