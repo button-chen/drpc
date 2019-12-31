@@ -53,7 +53,7 @@ func main() {
 		if err != nil {
 			log.Println("err: ", err.Error())
 		} else {
-			json.Unmarshal(ret, &tmp)
+			json.Unmarshal(msg, &tmp)
 			log.Println("return async: ", tmp.Result)
 		}
 	}

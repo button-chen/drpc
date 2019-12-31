@@ -3,7 +3,6 @@ package drpc
 import (
 	"encoding/json"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -18,7 +17,7 @@ type ConnMsgQue = chan DRpcMsg
 
 // DRPC 分布式rpc
 type DRPC struct {
-	
+
 	// MethodOwner 注册提供者集合
 	MethodOwner *Provider
 
@@ -39,6 +38,11 @@ type DRPC struct {
 	// 监听地址
 	addr string
 
+	// AOP相关
+	dbgLog Logger
+	handlers Middleware
+	monitorFunc MonitorFuncChain
+
 	stop chan struct{}
 }
 
@@ -58,8 +62,14 @@ func (d *DRPC) Run(addr string) {
 
 	http.HandleFunc("/drpcd/call", d.httpCall)
 	http.HandleFunc("/drpcd/pub", d.httpPub)
+	if d.handlers != nil {
+		hds := d.handlers.GetMapHandler()
+		for path, handler := range hds{
+			http.HandleFunc(path, d.createHandler(handler))
+		}
+	}
 	go func() {
-		log.Fatal(http.ListenAndServe(addr, nil))
+		d.dbgLog.Fatal(http.ListenAndServe(addr, nil))
 	}()
 	d.addr = addr
 	go d.deleteTimeout()
@@ -70,6 +80,21 @@ func (d *DRPC) RunPeer(addr, peerAddr string) {
 	d.Run(addr)
 	d.connectPeer(peerAddr)
 	d.ClusterAddr.Store(peerAddr, nil)
+}
+
+// SetLogger 设置自定义log
+func (d *DRPC) SetLogger(logger Logger) {
+	d.dbgLog = logger
+}
+
+// HTTPUse 使用http作为客户端时，提供接口使兼容
+func (d *DRPC) HTTPUse(handlers Middleware) {
+	d.handlers = handlers
+}
+
+// Use 收到的消息都会回调注册的过程
+func (d *DRPC) Use(handlers ...MonitorFunc) {
+	d.monitorFunc = append(d.monitorFunc, handlers...)
 }
 
 // Stop 停止服务
@@ -83,15 +108,43 @@ func (d *DRPC) init() {
 	d.TopicSub = NewSubscribe()
 
 	d.NotifyMember = make(map[ConnMsgQue]struct{})
+	d.monitorFunc = make(MonitorFuncChain, 0)
+	d.dbgLog = &DefLogger{}
 
 	d.stop = make(chan struct{})
+}
+
+func (d *DRPC) createHandler(fn HandlerFunc) func(w http.ResponseWriter, r *http.Request) {
+
+	return func (w http.ResponseWriter, r *http.Request){
+		fn(w, r, func(msg DRpcMsg) []byte{
+			// 构造请求参数
+			msg.Type = TypeCall
+			msg.UniqueID = time.Now().UnixNano()
+			if msg.Timeout == 0 {
+				// 超时没有赋值，默认给5秒
+				msg.Timeout = 5000
+			}
+			que := make(ConnMsgQue, 1)
+			d.call(msg, que)
+			// 等待结果
+			select {
+			case msg = <-que:
+			case <-time.After(time.Millisecond * time.Duration(msg.Timeout)):
+				msg.ErrCode = ErrCodeRepTimeout
+				msg.Body = "请求超时"
+				d.dbgLog.Info("http call timeout: ", msg.Timeout)
+			}
+			return d.httpError(msg.ErrCode, msg.Body)
+		})
+	}
 }
 
 func (d *DRPC) connectPeer(peerAddr string) error {
 	u := url.URL{Scheme: "ws", Host: peerAddr, Path: "/"}
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
-		log.Println("dial peer:", err)
+		d.dbgLog.Info("dial peer:", err)
 		return err
 	}
 	que := make(ConnMsgQue, 1024)
@@ -135,7 +188,7 @@ func (d *DRPC) updateClusterNetAddrs(netAddrInfo string) {
 		select {
 		case que <- msg:
 		case <-time.After(time.Second):
-			log.Println("TypeUpdateNetAddr timeout")
+			d.dbgLog.Info("TypeUpdateNetAddr timeout")
 		}
 	}
 }
@@ -220,7 +273,7 @@ func (d *DRPC) httpCall(w http.ResponseWriter, r *http.Request) {
 	case <-time.After(time.Millisecond * time.Duration(msg.Timeout)):
 		msg.ErrCode = ErrCodeRepTimeout
 		msg.Body = "请求超时"
-		log.Println("http call timeout: ", msg.Timeout)
+		d.dbgLog.Info("http call timeout: ", msg.Timeout)
 	}
 
 	w.Write(d.httpError(msg.ErrCode, msg.Body))
@@ -315,7 +368,7 @@ func (d *DRPC) readPeer(c *websocket.Conn, que ConnMsgQue) {
 	}
 	// 如果此时和集群还有关系就不需要去主动连接
 	if d.getNotifyCount() > 0 {
-		log.Println("exist valid connect from other member")
+		d.dbgLog.Info("exist valid connect from other member")
 		return
 	}
 	// 找到一个可以连接的兄弟
@@ -326,13 +379,13 @@ func (d *DRPC) readPeer(c *websocket.Conn, que ConnMsgQue) {
 		}
 		// 这里有时机问题，当 A -> B   B->A  同时连上，就形成了环， 怎么搞？
 		if d.getNotifyCount() > 0 {
-			log.Println("new valid connect from other member, not try connect")
+			d.dbgLog.Info("new valid connect from other member, not try connect")
 			return false
 		}
 		if d.connectPeer(addr) != nil {
 			return true
 		}
-		log.Println("try connect peer success ", addr)
+		d.dbgLog.Info("try connect peer success ", addr)
 		return false
 	})
 }
@@ -358,7 +411,7 @@ func (d *DRPC) readMessage(c *websocket.Conn, que ConnMsgQue) {
 						Type:     TypeUnReg,
 						FuncName: fnName,
 					}
-					log.Println("disconnect TypeUnReg", fnName)
+					d.dbgLog.Info("disconnect TypeUnReg", fnName)
 					d.notify(msg, que)
 				}
 			}
@@ -398,28 +451,31 @@ func (d *DRPC) _readMessage(c *websocket.Conn, que ConnMsgQue) (int, error) {
 		d.writeError(msg, que)
 		return TypeUnknow, nil
 	}
+	for _, handler := range d.monitorFunc {
+		handler(msg)
+	}
 	switch msg.Type {
 	case TypeReg:
-		log.Println("recv TypeReg ", msg.FuncName)
+		d.dbgLog.Info("recv TypeReg ", msg.FuncName)
 		d.reg(msg, que)
 	case TypeCall:
 		d.call(msg, que)
 	case TypeResp:
 		d.resp(msg)
 	case TypeRegNotify:
-		log.Println("recv TypeRegNotify")
+		d.dbgLog.Info("recv TypeRegNotify")
 		d.regNotify(msg, que)
 	case TypeUnReg:
-		log.Println("recv TypeUnReg", msg.FuncName)
+		d.dbgLog.Info("recv TypeUnReg", msg.FuncName)
 		d.unReg(msg, que)
 	case TypeUpdateNetAddr:
-		log.Println("recv TypeUpdateNetAddr")
+		d.dbgLog.Info("recv TypeUpdateNetAddr")
 		d.update(msg)
 	case TypeSub:
-		log.Println("recv TypeSub")
+		d.dbgLog.Info("recv TypeSub")
 		d.sub(c.RemoteAddr().String(), msg, que)
 	case TypeUnSub:
-		log.Println("recv TypeUnSub")
+		d.dbgLog.Info("recv TypeUnSub")
 		d.unSub(c.RemoteAddr().String(), msg, que)
 	case TypePub:
 		d.pub(msg, c.RemoteAddr().String())
@@ -468,7 +524,7 @@ func (d *DRPC) notify(msg DRpcMsg, curQue ConnMsgQue) {
 		select {
 		case que <- msg:
 		case <-time.After(time.Second):
-			log.Println("notify timeout")
+			d.dbgLog.Info("notify timeout")
 		}
 	}
 }
