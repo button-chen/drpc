@@ -23,9 +23,6 @@ type funcType struct {
 	rst interface{}
 }
 
-var allFunc = make(map[string]funcType)
-
-
 // Reg: 函数名 功能函数 参数列表（指针） 返回值列表（指针）
 func (jc *JsonCall) Reg(fnName string, fn, pst, rst interface{}) {
 	if _, ok := jc.funcMap.Load(fnName); ok {
