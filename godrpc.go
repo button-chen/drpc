@@ -15,7 +15,7 @@ import (
 type DRpcClient struct {
 	conn *websocket.Conn
 	// 注册函数
-	regFunc map[string]func(param []byte) []byte
+	regFunc *JsonCall
 	// 接收call结果
 	result map[int64]chan DRpcMsg
 	// result 的同步锁
@@ -35,7 +35,7 @@ type DRpcClient struct {
 // NewDRPCClient 新建
 func NewDRPCClient() *DRpcClient {
 	return &DRpcClient{
-		regFunc:       make(map[string]func(param []byte) []byte),
+		regFunc:       &JsonCall{},
 		result:        make(map[int64]chan DRpcMsg),
 		asyncCache:    make(chan func(), 1024),
 		aresult:       make(map[int64]func(int64, []byte, error)),
@@ -89,8 +89,8 @@ func (d *DRpcClient) AsyncCall(fnName string, param []byte, timeout int64, fn fu
 }
 
 // Register 注册功能函数
-func (d *DRpcClient) Register(fnName, callDoc string, fn func(param []byte) []byte) error {
-	d.regFunc[fnName] = fn
+func (d *DRpcClient) Register(fnName, callDoc string, fn, pst, rst interface{}) error {
+	d.regFunc.Reg(fnName, fn, pst, rst)
 
 	uid := d.createUniqueID()
 	req := DRpcMsg{
@@ -180,12 +180,8 @@ func (d *DRpcClient) recvSub(msg DRpcMsg) {
 }
 
 func (d *DRpcClient) recvCall(msg DRpcMsg) {
-	fn, ok := d.regFunc[msg.FuncName]
-	if !ok {
-		log.Println("not function: ", msg.FuncName)
-		return
-	}
-	ret := fn([]byte(msg.Body))
+
+	ret, _ := d.regFunc.Call(msg.FuncName, []byte(msg.Body))
 	msg.Body = string(ret)
 	msg.Type = TypeResp
 	msg.ErrCode = ErrCodeOK
