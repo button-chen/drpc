@@ -36,35 +36,19 @@ import (
 	"crypto/hmac"
 	"crypto/md5"
 	"encoding/hex"
-	"encoding/json"
 	"flag"
+	"log"
 	"os"
 	"os/signal"
 
 	"github.com/button-chen/drpc"
 )
 
-// 被注册的函数参数与返回值都必须为[]byte，实际上就是json格式
-// 思想： 把任何需要注册的函数的参数和返回值都json化进行调用
-func myHMACMD5(param []byte) []byte {
-	pts := struct {
-		Key  string `json:"key"`
-		Data string `json:"data"`
-	}{}
-	err := json.Unmarshal(param, &pts)
-	if err != nil {
-		return []byte("")
-	}
-	hmac := hmac.New(md5.New, []byte(pts.Key))
-	hmac.Write([]byte(pts.Data))
+func myHMACMD5(data, key []byte) string {
+	hmac := hmac.New(md5.New, key)
+	hmac.Write(data)
 
-	ret := struct {
-		Result string `json:"result"`
-	}{
-		hex.EncodeToString(hmac.Sum(nil)),
-	}
-	t, _ := json.Marshal(ret)
-	return t
+	return hex.EncodeToString(hmac.Sum(nil))
 }
 
 var myHMACMD5Doc = `
@@ -72,8 +56,8 @@ var myHMACMD5Doc = `
 功能: 计算hmac-md5
 参数(json)：
 {
-	"key":"",    // hmac-md5需要的key
-	"data":""    // hmac-md5需要加密的字符串
+	"data":"",    // hmac-md5需要加密的字符串
+	"key":""	  // hmac-md5需要的key
 }
 返回值(json)：
 {
@@ -97,10 +81,26 @@ func main() {
 	// 连接到服务器
 	rpcclient.ConnectToDRPC(*addr)
 	// 注册功能函数
-	rpcclient.Register(*name, myHMACMD5Doc, myHMACMD5)
+	
+	// 参数列表
+	type pst struct {
+		Data string `json:"data"`
+		Key  string `json:"key"`
+	}
+	// 返回值列表
+	type rst struct {
+		Result string `json:"result"`
+	}
+	err := rpcclient.Register(*name, myHMACMD5Doc, myHMACMD5, (*pst)(nil), (*rst)(nil))
+	if err == nil {
+		log.Println("注册成功")
+	} else {
+		log.Println("注册失败: ", err)
+	}
 
 	<-interrupt
 }
+
 ```
 
 运用程序调用平台中被注册的功能, 方法一:  
