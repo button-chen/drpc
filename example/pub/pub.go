@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"log"
 	"time"
 
 	"github.com/button-chen/drpc"
@@ -17,11 +16,7 @@ func main() {
 	flag.Parse()
 
 	rpcclient := drpc.NewDRPCClient()
-	err := rpcclient.ConnectToDRPC(*addr)
-	if err != nil {
-		log.Println(err.Error())
-		return
-	}
+	rpcclient.ConnectToDRPC(*addr)
 
 	ticker := time.NewTicker(time.Millisecond * time.Duration(200))
 	for t := range ticker.C {

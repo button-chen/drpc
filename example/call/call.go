@@ -22,11 +22,8 @@ func main() {
 	signal.Notify(interrupt, os.Interrupt)
 
 	rpcclient := drpc.NewDRPCClient()
-	err := rpcclient.ConnectToDRPC(*addr)
-	if err != nil {
-		log.Println(err.Error())
-		return
-	}
+	rpcclient.ConnectToDRPC(*addr)
+
 	// 同步调用(不适合高频率的调用方式)
 	param := struct {
 		Key  string `json:"key"`
@@ -58,7 +55,7 @@ func main() {
 		}
 	}
 	for {
-		id := rpcclient.AsyncCall(*name, t, 2000, fn)
+		id, _ := rpcclient.AsyncCall(*name, t, 2000, fn)
 		// 返回的id与回调结果的第一个参数一致
 		_ = id
 		time.Sleep(time.Millisecond * 10)

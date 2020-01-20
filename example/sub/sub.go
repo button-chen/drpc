@@ -20,11 +20,7 @@ func main() {
 	signal.Notify(interrupt, os.Interrupt)
 
 	rpcclient := drpc.NewDRPCClient()
-	err := rpcclient.ConnectToDRPC(*addr)
-	if err != nil {
-		log.Println(err.Error())
-		return
-	}
+	rpcclient.ConnectToDRPC(*addr)
 
 	fn := func(msg string, err error) {
 		log.Println("recv topic data: ", msg)
