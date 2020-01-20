@@ -65,6 +65,7 @@ func (d *DRPC) Run(addr string) {
 	if d.handlers != nil {
 		hds := d.handlers.GetMapHandler()
 		for path, handler := range hds{
+			d.dbgLog.Info("注册扩展url: ", path)
 			http.HandleFunc(path, d.createHandler(handler))
 		}
 	}

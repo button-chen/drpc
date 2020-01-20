@@ -7,12 +7,25 @@ import (
 	"net/url"
 	"sync"
 	"time"
+	"errors"
 
 	"github.com/gorilla/websocket"
 )
 
+const (
+	StateConnecting = iota + 1
+	StateConnected
+	StateNotConnect
+)
+
+var (
+	ErrNotConnect = errors.New("与服务器断开")
+	ErrInternal = errors.New("服务器内部错误")
+)
+
 // DRpcClient 客户端类
 type DRpcClient struct {
+	address string
 	conn *websocket.Conn
 	// 注册函数
 	regFunc *JsonCall
@@ -29,6 +42,14 @@ type DRpcClient struct {
 	// 发布订阅
 	topicCallback map[string]func(string, error)
 
+	// 网络当前连接状态
+	netstate int
+	// 注册过的方法，用于断开之后重连时重新注册
+	regFuncState map[string]string
+
+	// 网络发送容器
+	sendPool chan DRpcMsg
+
 	stop chan struct{}
 }
 
@@ -40,25 +61,25 @@ func NewDRPCClient() *DRpcClient {
 		asyncCache:    make(chan func(), 1024),
 		aresult:       make(map[int64]func(int64, []byte, error)),
 		topicCallback: make(map[string]func(string, error)),
+		regFuncState:  make(map[string]string),
+		sendPool: 	   make(chan DRpcMsg, 256),
 		stop:          make(chan struct{}),
 	}
 }
 
 // ConnectToDRPC 连接到服务器
-func (d *DRpcClient) ConnectToDRPC(addr string) error {
-	u := url.URL{Scheme: "ws", Host: addr, Path: "/"}
-	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-	if err != nil {
-		return err
-	}
-	d.conn = c
-	go d.read()
+func (d *DRpcClient) ConnectToDRPC(addr string) {
+	d.address = addr
 	go d.execCallback()
-	return nil
+
+	d.mustConnect(d.address)
 }
 
 // Call 同步调用
 func (d *DRpcClient) Call(fnName string, param []byte, timeout int64) ([]byte, error) {
+	if d.netstate != StateConnected {
+		return  nil, ErrNotConnect
+	}
 	uid := d.createUniqueID()
 	req := DRpcMsg{
 		Type:     TypeCall,
@@ -71,7 +92,11 @@ func (d *DRpcClient) Call(fnName string, param []byte, timeout int64) ([]byte, e
 }
 
 // AsyncCall 异步调用
-func (d *DRpcClient) AsyncCall(fnName string, param []byte, timeout int64, fn func(int64, []byte, error)) int64 {
+func (d *DRpcClient) AsyncCall(fnName string, param []byte, timeout int64, fn func(int64, []byte, error)) (int64, error) {
+	if d.netstate != StateConnected {
+		return 0, ErrNotConnect
+	}
+
 	uid := d.createUniqueID()
 	req := DRpcMsg{
 		Type:     TypeCall,
@@ -84,13 +109,21 @@ func (d *DRpcClient) AsyncCall(fnName string, param []byte, timeout int64, fn fu
 	d.aresult[uid] = fn
 	d.amu.Unlock()
 
-	d.conn.WriteJSON(req)
-	return uid
+	err := d.conn.WriteJSON(req)
+	if err != nil {
+		return 0, ErrInternal
+	}
+	return uid, nil
 }
 
 // Register 注册功能函数
 func (d *DRpcClient) Register(fnName, callDoc string, fn, pst, rst interface{}) error {
 	d.regFunc.Reg(fnName, fn, pst, rst)
+	d.regFuncState[fnName] = callDoc
+
+	if d.netstate != StateConnected {
+		return ErrNotConnect
+	}
 
 	uid := d.createUniqueID()
 	req := DRpcMsg{
@@ -106,29 +139,81 @@ func (d *DRpcClient) Register(fnName, callDoc string, fn, pst, rst interface{}) 
 // Sub 订阅
 func (d *DRpcClient) Sub(topic string, fn func(string, error)) {
 	d.topicCallback[topic] = fn
-	param := DRpcMsg{
+	msg := DRpcMsg{
 		Type:     TypeSub,
 		FuncName: topic,
 	}
-	err := d.conn.WriteJSON(param)
-	if err != nil {
-		log.Println("Sub:", err)
+	if d.netstate != StateConnected {
 		return
 	}
+	d.sendPool <- msg
 }
 
 // Pub 发布
-func (d *DRpcClient) Pub(topic, content string, timeout int64) {
-	param := DRpcMsg{
+func (d *DRpcClient) Pub(topic, content string, timeout int64) error{
+
+	if d.netstate != StateConnected {
+		return ErrNotConnect
+	}
+	msg := DRpcMsg{
 		Type:     TypePub,
 		FuncName: topic,
 		Body:     content,
 		Timeout:  timeout,
 	}
-	err := d.conn.WriteJSON(param)
+	d.sendPool <- msg
+	return nil
+}
+
+func (d *DRpcClient) connect(addr string) error {
+	u := url.URL{Scheme: "ws", Host: addr, Path: "/"}
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
-		log.Println("Pub:", err)
-		return
+		return err
+	}
+	d.conn = c
+	go d.read()
+	go d.write()
+	return nil
+}
+
+func (d *DRpcClient) mustConnect(addr string) {
+	go func(){
+		d.netstate = StateConnecting
+		for  {
+			err := d.connect(d.address)
+			if err != nil {
+				time.Sleep(time.Second*2)
+				continue
+			}
+			d.netstate = StateConnected
+			d.reRegister()
+			d.reSub()
+			break
+		}
+	}()
+}
+
+func (d *DRpcClient) reRegister() {
+	for fnName, callDoc := range d.regFuncState {
+		uid := d.createUniqueID()
+		req := DRpcMsg{
+			Type:     TypeReg,
+			FuncName: fnName,
+			Doc:      callDoc,
+			UniqueID: uid,
+		}
+		d.call(req)
+	}
+}
+
+func (d *DRpcClient) reSub() {
+	for topic := range d.topicCallback {
+		msg := DRpcMsg{
+			Type:     TypeSub,
+			FuncName: topic,
+		}
+		d.sendPool <- msg
 	}
 }
 
@@ -138,7 +223,7 @@ func (d *DRpcClient) call(msg DRpcMsg) ([]byte, error) {
 	d.result[msg.UniqueID] = retChan
 	d.mu.Unlock()
 
-	d.conn.WriteJSON(msg)
+	d.sendPool <- msg
 
 	if msg.Timeout == 0 {
 		msg.Timeout = 1000
@@ -180,16 +265,17 @@ func (d *DRpcClient) recvSub(msg DRpcMsg) {
 }
 
 func (d *DRpcClient) recvCall(msg DRpcMsg) {
+	go func(){
+		ret, err := d.regFunc.Call(msg.FuncName, []byte(msg.Body))
+		if err != nil {
+			log.Println("jsoncall:", err)
+		}
+		msg.Body = string(ret)
+		msg.Type = TypeResp
+		msg.ErrCode = ErrCodeOK
 
-	ret, _ := d.regFunc.Call(msg.FuncName, []byte(msg.Body))
-	msg.Body = string(ret)
-	msg.Type = TypeResp
-	msg.ErrCode = ErrCodeOK
-	err := d.conn.WriteJSON(msg)
-	if err != nil {
-		log.Println("resp:", err)
-		return
-	}
+		d.sendPool <- msg
+	}()
 }
 
 func (d *DRpcClient) recvResp(msg DRpcMsg) {
@@ -224,11 +310,13 @@ func (d *DRpcClient) recvResp(msg DRpcMsg) {
 }
 
 func (d *DRpcClient) read() {
+
+	defer d.mustConnect(d.address)
 	for {
 		_, message, err := d.conn.ReadMessage()
 		if err != nil {
 			log.Println("read:", err)
-			close(d.asyncCache)
+			d.netstate = StateNotConnect
 			return
 		}
 		var msg DRpcMsg
@@ -245,6 +333,19 @@ func (d *DRpcClient) read() {
 			d.recvSub(msg)
 		default:
 			log.Println("unknow type: ", msg)
+		}
+	}
+}
+
+func (d *DRpcClient) write() {
+	for msg := range d.sendPool {
+		if d.netstate != StateConnected {
+			d.sendPool <- msg
+			continue
+		}
+		err := d.conn.WriteJSON(msg)
+		if err != nil {
+			log.Println("写协程: ", err)
 		}
 	}
 }

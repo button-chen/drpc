@@ -3,6 +3,7 @@ package drpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 )
@@ -46,10 +47,10 @@ func (jc *JsonCall) Call(fnName string, arg []byte) ([]byte, error){
 		return nil, err
 	}
 
-	jc.call(fnInfo.fn, pst, rst)
+	err = jc.call(fnInfo.fn, pst, rst)
 
 	d, _ := json.Marshal(rst)
-	return d, nil
+	return d, err
 }
 
 // 注意： pst rst 传进来的是指针类型
@@ -80,13 +81,24 @@ func fillResult(vRet []reflect.Value, rst interface{})  error{
 	dValue := reflect.ValueOf(rst).Elem()
 
 	num := dType.NumField()
-	if num != len(vRet) {
+	if num != len(vRet) && num != len(vRet)+1 {
 		return errors.New("结果与返回值列表个数不匹配")
 	}
-	for i := 0; i < num; i++ {
+	for i, r := range vRet {
 		fieldValue := dValue.FieldByName(dType.Field(i).Name)
-		if fieldValue.CanSet(){
-			fieldValue.Set(vRet[i])
+		if !fieldValue.CanSet(){
+			panic(fmt.Sprintf("返回值结构字段 %d 不能被赋值", i))
+		}
+		if v, ok := r.Interface().(error); !ok {
+			fieldValue.Set(r)
+		}else{
+			// error的返回值转化为一个bool 与 一个string
+			var b bool
+			if v == nil {
+				b = true
+			}
+			fieldValue.Set(reflect.ValueOf(b))
+			dValue.FieldByName(dType.Field(i+1).Name).Set(reflect.ValueOf(v.Error()))
 		}
 	}
 	return nil
