@@ -54,7 +54,7 @@ func (jc *JsonCall) Call(fnName string, arg []byte) ([]byte, error){
 }
 
 // 注意： pst rst 传进来的是指针类型
-func (jc *JsonCall) call(fn interface{},  pst, rst interface{}) error{
+func (jc *JsonCall) call(fn interface{}, pst, rst interface{}) error{
 	// 准备参数
 	dType := reflect.TypeOf(pst).Elem()
 	dValue := reflect.ValueOf(pst).Elem()
@@ -72,16 +72,15 @@ func (jc *JsonCall) call(fn interface{},  pst, rst interface{}) error{
 	rs := reflect.ValueOf(fn).Call(params)
 
 	// 填充结果
-	return fillResult(rs, rst)
+	return fillResult(fn, rs, rst)
 }
 
 // 结果数组  结果列表
-func fillResult(vRet []reflect.Value, rst interface{})  error{
+func fillResult(fn interface{}, vRet []reflect.Value, rst interface{})  error{
 	dType := reflect.TypeOf(rst).Elem()
 	dValue := reflect.ValueOf(rst).Elem()
 
-	num := dType.NumField()
-	if num != len(vRet) && num != len(vRet)+1 {
+	if dType.NumField() < len(vRet) {
 		return errors.New("结果与返回值列表个数不匹配")
 	}
 	for i, r := range vRet {
@@ -89,16 +88,18 @@ func fillResult(vRet []reflect.Value, rst interface{})  error{
 		if !fieldValue.CanSet(){
 			panic(fmt.Sprintf("返回值结构字段 %d 不能被赋值", i))
 		}
-		if v, ok := r.Interface().(error); !ok {
+		if reflect.TypeOf(fn).Out(i).String() != "error"  {
 			fieldValue.Set(r)
-		}else{
-			// error的返回值转化为一个bool 与 一个string
-			var b bool
-			if v == nil {
-				b = true
+		}else {
+			var code bool
+			var errMsg string
+			if r.IsNil() {
+				code = true
+			}else{
+				errMsg = r.Interface().(error).Error()
 			}
-			fieldValue.Set(reflect.ValueOf(b))
-			dValue.FieldByName(dType.Field(i+1).Name).Set(reflect.ValueOf(v.Error()))
+			dValue.FieldByName(dType.Field(i).Name).Set(reflect.ValueOf(code))
+			dValue.FieldByName(dType.Field(i+1).Name).Set(reflect.ValueOf(errMsg))
 		}
 	}
 	return nil
